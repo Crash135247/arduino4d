@@ -1,0 +1,300 @@
+
+/* 
+By Jos Kroon.
+This project reads the sensor for a 35 litre fuel tank and displays it on an
+OLED. A button next to the gauge loads the current fuel reading into eeprom 
+so that it can be recalled at any later stage - even after the arduino has lost power.   
+This is to allow me to register the fuel onboard prior to the start of a race 
+and then after the race is finished, be able to calculate the fuel used during the race
+by mentally subtracting the finish fuel level from the starting fuel level...
+
+The display update frequency is high for 3 minutes after ignition is on.  This is so I 
+can get a timely update of the fuel level as I'm putting fuel into the tank.  After the 
+refuelling, the update happens infrequently as its both wildly innaccurate and distracting.
+It's wildly innaccurate as the fuel sloshes around crazily during a race and the highly smoothed 
+average updated every 30secs is the only fair representation of the amount of fuel there is in the tank
+*/
+/*********************************************************************
+Monochrome OLEDs based on SSD1306 drivers
+  Pick one up today in the adafruit shop!
+  ------> http://www.adafruit.com/category/63_98
+
+This is for a 128x64 size display using I22C
+
+Adafruit invests time and resources providing this open source code,
+please support Adafruit and open-source hardware by purchasing
+products from Adafruit!
+
+Written by Limor Fried/Ladyada  for Adafruit Industries.
+BSD license, check license.txt for more information
+All text above, and the splash screen must be included in any redistribution
+
+*********************************************************************/
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
+
+#define OLED_RESET 4
+Adafruit_SSD1306 display(OLED_RESET);
+// The array of measures readings per litre added to the tank
+// (This array was partially made up as some readings were erratic due to the age of the sensor)
+// It was smoothed using excel to extrapolate known stable readings
+int maxFuel = 35; // Fuel tank full to brim
+//   Readings of resistance from fuel sender, over a bridge onto the arduino pin
+//      So... the folowing are raw readings off the pin as the tank was filled
+//      from 0 to 35 litres.  
+float fuelReading[]
+{
+  145,
+  154,
+  164,
+  170,
+  173,
+  190,
+  195,
+  209,
+  220,
+  224,
+  236,
+  243,
+  247,
+  255,
+  267,
+  271,
+  277,
+  283,
+  294,
+  300,
+  310,
+  320,
+  325,
+  333,
+  340,
+  348,
+  356,
+  364,
+  372,
+  380,
+  386,
+  395,
+  403,
+  410,
+  419,
+  426
+};
+
+
+const int buttonPin = 8;    // the number of the pushbutton pin
+const int ledPin = 13;      // the number of the LED pin 
+
+// Warning: Variables will change:
+int ledState = HIGH;         // the current state of the output pin
+int buttonState;             // the current reading from the input pin
+int lastButtonState = LOW;   // the previous reading from the input pin
+//
+
+int average = 0;                // the average
+
+int inputPin = A0;
+
+// the following variables are long's because the time, measured in miliseconds,
+// will quickly become a bigger number than can be stored in an int.
+long lastDebounceTime = 0;  // the last time the output pin was toggled
+long debounceDelay = 50;    // the debounce time; increase if the output flickers
+float y = 0;
+float f = 0;   //Variable to store data read from EEPROM.
+float litres = 0;
+int eeAddress = 0; //EEPROM address to start reading from
+long dspDelay = 1000;
+long dspLast = 0;
+long timeNow = 0;
+long timeStart = 0;  // initialised in setup()
+long ignitionDelay = 300000; // 5 minutes
+int  ignitionDelayIsOver = 0;
+long averageCount = 0;
+long averageLimit = 10;
+float readingSum = 0;
+float alpha = .95;
+//======================================================================================
+//    S E T U P
+//======================================================================================
+void setup()   {
+ // Serial.begin(115200);
+  pinMode(buttonPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  timeStart = millis();
+  // set initial LED state
+  digitalWrite(ledPin, ledState);
+  //
+
+  // by default, we'll generate the high voltage from the 3.3v line internally! (neat!)
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3D);  // initialize with the I2C addr 0x3D (for the 128x64)
+  // init done
+  // Show image buffer on the display hardware.
+  // Since the buffer is intialized with an Adafruit splashscreen
+  // internally, this will display the splashscreen.
+  display.display();
+  delay(2000);
+
+  //Get the float data from the EEPROM at position 'eeAddress'
+  EEPROM.get( eeAddress, f );
+  // plug it into the average to give smoothing a start.
+  average = f;
+}
+//======================================================================================
+//    L O O P
+//======================================================================================
+void loop() {
+  display.clearDisplay();
+  getReading();// Read the sensor and smooth result
+  GetLitres(y);
+  // After refueling if delay for fueling isn't registered as over yet then check if it is ....
+  if (!ignitionDelayIsOver) {
+    timeNow = millis();
+    if ((timeNow - timeStart) >= ignitionDelay) {
+      ignitionDelayIsOver = 1;
+    }
+  }
+  buttonPress(); // Check if the button was pressed. If so, store qty in eeprom
+// Display is updated according to the delay.  Updating too often is a distraction
+
+  if (millis() - dspLast >= dspDelay) {
+    dspLast = millis();
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(50, 0);
+    display.println("FUEL");  // In case you've forgotten what this gauge is for
+    if (litres >= 10) {
+      display.setCursor(18, 20);
+    }
+    else {
+      display.setCursor(36, 20);
+    }
+    display.setTextSize(3);
+    //  display.print("      ");
+    display.println(litres);
+    display.setTextSize(1);
+    display.setCursor(48, 50);
+    display.println(f);
+    //   display.println(y); // for testing porpoises only
+    display.display();
+    delay(1);
+  }
+}
+
+//======================================================================================
+// C H E C K    F O R   B U T T O N   P R E S S
+//======================================================================================
+int buttonPress() {
+  // read the state of the switch into a local variable:
+  int reading = digitalRead(buttonPin);
+
+  // check to see if you just pressed the button
+  // (i.e. the input went from LOW to HIGH),  and you've waited
+  // long enough since the last press to ignore any noise:
+
+  // If the switch changed, due to noise or pressing:
+  if (reading != lastButtonState) {
+    // reset the debouncing timer
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // whatever the reading is at, it's been there for longer
+    // than the debounce delay, so take it as the actual current state:
+
+    // if the button state has changed:
+    if (reading != buttonState) {
+      buttonState = reading;
+      //---------------------------------------------
+      // Store current reading into eeprom
+      f = litres;  //Variable to store y into EEPROM.
+      int eeAddress = 0;   //Location we want the data to be put.
+
+      //One simple call, with the address first and the object second.
+      // Put uses the "update" protocol and doesn't write if no change
+      //  (this saves wasted writes - theres only so many an eeprom can take
+      EEPROM.put( eeAddress, f );
+      //----------------------------------------------
+      // only toggle the LED if the new button state is HIGH
+      if (buttonState == HIGH) {
+        ledState = !ledState;
+      }
+    }
+  }
+
+  // set the LED:
+  digitalWrite(ledPin, ledState);
+
+  // save the reading.  Next time through the loop,
+  // it'll be the lastButtonState:
+  lastButtonState = reading;
+}
+//======================================================================================
+//    R E A D   T H E   F U E L   S E N D E R
+//======================================================================================
+int getReading() {
+
+  y = analogRead(inputPin);
+  average = (alpha * analogRead(inputPin)) + ((1 - alpha) * average);  //exponential smoothing
+// randomSeed(dspLast);
+// y=random(150,420);  // This is for testing only.   
+}
+
+//======================================================================================
+//    C O N V E R T   T O   L I T R E S
+//======================================================================================
+// Converts the fuel Reading into Litres.
+// Litres = the element# of the array + the fraction to the next reading
+// If the reading is higher than the highest array value then it is equal to max litres
+// By default,  if no reading is found then then litres = 0.
+//======================================================================================
+float GetLitres(float sensorReading)
+{
+// Reset to safety of zero
+  float LookedupValue = 0;
+//  If the reading is too high (Hardware errror) then force to maximum
+  if (sensorReading >= fuelReading[maxFuel]) {
+    LookedupValue = 35.99;
+  }
+  else {
+    //This searches the 2 surrounding values, and then linear interpolates between them.
+    //   We do this in order to get the closest expected value to the actual value
+    for (int i = 0; i < maxFuel; i++)
+    {
+      if (sensorReading >= (fuelReading[i]) && sensorReading <= fuelReading[i + 1])
+      {
+        LookedupValue = i + (sensorReading - fuelReading[i]) / (fuelReading[i + 1] - fuelReading[i]);
+        break;  // Crash out with the answer
+      }
+    }
+  }
+  litres = LookedupValue;
+  if (ignitionDelayIsOver) {
+  //  When the amout of fuel is less than 4 litres then the result is no longer 
+  //    rounded to 1/4 litres. Every little bit is now important
+    if (litres > 4) {
+    Roundup(litres);
+    }
+  }
+
+  return LookedupValue;
+}
+
+//======================================================================================
+//  R O U N D  T O  1/4  o r   0.25
+//======================================================================================
+// Round to .25 because lesser fractional amounts don't matter
+float Roundup(float Value) {
+  float inc = 0.25;
+  float numberIncs = Value / inc;
+  int wholeIncs = numberIncs + 0.5;
+  Value = wholeIncs * inc;
+  litres = Value;
+}
+
+
+
